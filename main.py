@@ -2,6 +2,9 @@
 import base64
 import time
 import traceback
+import os
+import json
+import requests
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -19,8 +22,14 @@ app.add_middleware(
 
 AXE_CDN = "https://cdnjs.cloudflare.com/ajax/libs/axe-core/4.9.1/axe.min.js"
 
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
+GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
+GROQ_MODEL = "llama-3.3-70b-versatile"
+
+
 class ScanRequest(BaseModel):
     url: str
+
 
 @app.post("/scan")
 def scan(req: ScanRequest):  # note: plain def, not async def
@@ -72,3 +81,139 @@ def scan(req: ScanRequest):  # note: plain def, not async def
     except Exception as e:
         traceback.print_exc()
         return JSONResponse(status_code=400, content={"detail": f"Scan failed: {str(e)}"})
+
+
+class AgentRunRequest(BaseModel):
+    url: str
+    goal: str
+
+
+def get_interactive_elements(page):
+    return page.evaluate("""
+    () => {
+      const selectors = 'a, button, input, textarea, select, [role="button"], [role="link"]';
+      const els = Array.from(document.querySelectorAll(selectors));
+      const visible = els.filter(el => {
+        const r = el.getBoundingClientRect();
+        return r.width > 0 && r.height > 0 && r.top < window.innerHeight && r.top > -50;
+      }).slice(0, 30);
+      visible.forEach((el, i) => el.setAttribute('data-agent-index', String(i)));
+      return visible.map((el, i) => ({
+        index: i,
+        tag: el.tagName.toLowerCase(),
+        text: (el.innerText || el.value || el.placeholder || el.getAttribute('aria-label') || '').trim().slice(0, 60),
+        inputType: el.getAttribute('type') || ''
+      }));
+    }
+    """)
+
+
+def ask_llm_next_action(goal, url, elements, history):
+    elements_text = "\n".join(
+        f'[{e["index"]}] <{e["tag"]}{" type=" + e["inputType"] if e["inputType"] else ""}> "{e["text"]}"'
+        for e in elements
+    )
+    history_text = "\n".join(
+        f'Step {i+1}: {h["action"]} on [{h.get("index", "-")}] {h.get("text", "")}'
+        for i, h in enumerate(history)
+    ) or "None yet."
+
+    prompt = f"""You are a web-browsing agent. Goal: "{goal}"
+Current page: {url}
+
+Visible interactive elements:
+{elements_text}
+
+Actions taken so far:
+{history_text}
+
+Decide the SINGLE next action to progress toward the goal. Respond with ONLY raw JSON, no markdown, no explanation:
+{{"action": "click" | "type" | "done", "index": <element index or null>, "text": "<text to type, or null>", "reasoning": "<one short sentence>"}}
+
+Use "done" if the goal appears complete or no useful element exists. Pick "type" only for input/textarea elements, then follow it with "click" on a submit/search button in a later step if needed."""
+
+    resp = requests.post(
+        GROQ_URL,
+        headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
+        json={
+            "model": GROQ_MODEL,
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0.2,
+            "max_tokens": 300,
+        },
+        timeout=20,
+    )
+    resp.raise_for_status()
+    content = resp.json()["choices"][0]["message"]["content"].strip()
+    content = content.strip("`").replace("json\n", "").strip()
+    return json.loads(content)
+
+
+@app.post("/agent-run")
+def agent_run(req: AgentRunRequest):
+    if not GROQ_API_KEY:
+        return JSONResponse(status_code=500, content={"detail": "GROQ_API_KEY not set on server."})
+
+    url = req.url.strip()
+    if not url.startswith("http"):
+        url = "https://" + url
+
+    MAX_STEPS = 6
+    history = []
+    screenshots = []
+
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            page = browser.new_page(viewport={"width": 1280, "height": 800})
+            page.goto(url, wait_until="domcontentloaded", timeout=20000)
+
+            for step in range(MAX_STEPS):
+                elements = get_interactive_elements(page)
+                shot = base64.b64encode(page.screenshot(full_page=False)).decode("utf-8")
+                screenshots.append(f"data:image/png;base64,{shot}")
+
+                try:
+                    decision = ask_llm_next_action(req.goal, page.url, elements, history)
+                except Exception as e:
+                    history.append({"action": "error", "text": f"LLM decision failed: {e}"})
+                    break
+
+                action = decision.get("action")
+                idx = decision.get("index")
+                text = decision.get("text")
+                reasoning = decision.get("reasoning", "")
+
+                if action == "done":
+                    history.append({"action": "done", "reasoning": reasoning})
+                    break
+
+                try:
+                    target = page.locator(f'[data-agent-index="{idx}"]')
+                    if action == "click":
+                        target.click(timeout=5000)
+                    elif action == "type" and text:
+                        target.fill(text, timeout=5000)
+                    history.append({"action": action, "index": idx, "text": text, "reasoning": reasoning})
+                    page.wait_for_timeout(1200)
+                except Exception as e:
+                    history.append({"action": action, "index": idx, "text": text, "reasoning": reasoning, "error": str(e)})
+                    break
+
+            final_shot = base64.b64encode(page.screenshot(full_page=False)).decode("utf-8")
+            final_url = page.url
+            browser.close()
+
+        return {
+            "goal": req.goal,
+            "startUrl": url,
+            "finalUrl": final_url,
+            "history": history,
+            "screenshots": screenshots,
+            "finalScreenshot": f"data:image/png;base64,{final_shot}",
+            "stepsTaken": len(history),
+        }
+
+    except Exception as e:
+        traceback.print_exc()
+        return JSONResponse(status_code=400, content={"detail": f"Agent run failed: {str(e)}"})
