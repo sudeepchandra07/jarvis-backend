@@ -200,9 +200,31 @@ def agent_run(req: AgentRunRequest):
                     history.append({"action": action, "index": idx, "text": text, "reasoning": reasoning, "error": str(e)})
                     break
 
+                        violations = []
+            try:
+                page.add_script_tag(url=AXE_CDN)
+                page.wait_for_timeout(500)
+                raw = page.evaluate("async () => { const r = await axe.run(); return JSON.parse(JSON.stringify(r)); }")
+                for v in raw.get("violations", []):
+                    for node in v.get("nodes", []):
+                        violations.append({
+                            "id": v.get("id"),
+                            "impact": v.get("impact") or "minor",
+                            "title": v.get("help"),
+                            "description": v.get("description"),
+                            "wcag": ", ".join(t.upper() for t in v.get("tags", []) if t.startswith("wcag")) or "Best Practice",
+                            "selector": (node.get("target") or ["unknown"])[0],
+                            "helpUrl": v.get("helpUrl"),
+                        })
+            except Exception as axe_err:
+                print("final axe-core scan failed:", axe_err)
+
             final_shot = base64.b64encode(page.screenshot(full_page=False)).decode("utf-8")
             final_url = page.url
             browser.close()
+
+        goal_completed = any(h.get("action") == "done" for h in history)
+        errored = any(h.get("error") for h in history)
 
         return {
             "goal": req.goal,
@@ -212,6 +234,9 @@ def agent_run(req: AgentRunRequest):
             "screenshots": screenshots,
             "finalScreenshot": f"data:image/png;base64,{final_shot}",
             "stepsTaken": len(history),
+            "goalCompleted": goal_completed,
+            "errored": errored,
+            "violations": violations,
         }
 
     except Exception as e:
