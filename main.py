@@ -98,12 +98,16 @@ def get_interactive_elements(page):
         return r.width > 0 && r.height > 0 && r.top < window.innerHeight && r.top > -50;
       }).slice(0, 30);
       visible.forEach((el, i) => el.setAttribute('data-agent-index', String(i)));
-      return visible.map((el, i) => ({
-        index: i,
-        tag: el.tagName.toLowerCase(),
-        text: (el.innerText || el.value || el.placeholder || el.getAttribute('aria-label') || '').trim().slice(0, 60),
-        inputType: el.getAttribute('type') || ''
-      }));
+      return visible.map((el, i) => {
+        const r = el.getBoundingClientRect();
+        return {
+          index: i,
+          tag: el.tagName.toLowerCase(),
+          text: (el.innerText || el.value || el.placeholder || el.getAttribute('aria-label') || '').trim().slice(0, 60),
+          inputType: el.getAttribute('type') || '',
+          bbox: { x: r.x, y: r.y, width: r.width, height: r.height }
+        };
+      });
     }
     """)
 
@@ -118,7 +122,7 @@ def ask_llm_next_action(goal, url, elements, history):
         for i, h in enumerate(history)
     ) or "None yet."
 
-    prompt = f"""You are a web-browsing agent. Goal: "{goal}"
+    prompt = f"""You are a web-browsing agent. Task: "{goal}"
 Current page: {url}
 
 Visible interactive elements:
@@ -127,10 +131,10 @@ Visible interactive elements:
 Actions taken so far:
 {history_text}
 
-Decide the SINGLE next action to progress toward the goal. Respond with ONLY raw JSON, no markdown, no explanation:
+Decide the SINGLE next action to progress toward the task. Respond with ONLY raw JSON, no markdown, no explanation:
 {{"action": "click" | "type" | "done", "index": <element index or null>, "text": "<text to type, or null>", "reasoning": "<one short sentence>"}}
 
-Use "done" if the goal appears complete or no useful element exists. Pick "type" only for input/textarea elements, then follow it with "click" on a submit/search button in a later step if needed."""
+Use "done" as soon as the task appears complete, or if no useful element exists. Pick "type" only for input/textarea elements, then follow it with "click" on a submit/search button in a later step if needed."""
 
     resp = requests.post(
         GROQ_URL,
@@ -158,7 +162,7 @@ def agent_run(req: AgentRunRequest):
     if not url.startswith("http"):
         url = "https://" + url
 
-    MAX_STEPS = 6
+    MAX_STEPS = 8
     history = []
     screenshots = []
 
@@ -176,7 +180,7 @@ def agent_run(req: AgentRunRequest):
                 try:
                     decision = ask_llm_next_action(req.goal, page.url, elements, history)
                 except Exception as e:
-                    history.append({"action": "error", "text": f"LLM decision failed: {e}"})
+                    history.append({"action": "error", "reasoning": f"LLM decision failed: {e}", "error": str(e)})
                     break
 
                 action = decision.get("action")
@@ -188,16 +192,19 @@ def agent_run(req: AgentRunRequest):
                     history.append({"action": "done", "reasoning": reasoning})
                     break
 
+                matched = next((e for e in elements if e["index"] == idx), None)
+                bbox = matched["bbox"] if matched else None
+
                 try:
                     target = page.locator(f'[data-agent-index="{idx}"]')
                     if action == "click":
                         target.click(timeout=5000)
                     elif action == "type" and text:
                         target.fill(text, timeout=5000)
-                    history.append({"action": action, "index": idx, "text": text, "reasoning": reasoning})
+                    history.append({"action": action, "index": idx, "text": text, "reasoning": reasoning, "bbox": bbox})
                     page.wait_for_timeout(1200)
                 except Exception as e:
-                    history.append({"action": action, "index": idx, "text": text, "reasoning": reasoning, "error": str(e)})
+                    history.append({"action": action, "index": idx, "text": text, "reasoning": reasoning, "bbox": bbox, "error": str(e)})
                     break
 
             violations = []
