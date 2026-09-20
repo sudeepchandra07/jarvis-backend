@@ -32,7 +32,7 @@ class ScanRequest(BaseModel):
 
 
 @app.post("/scan")
-def scan(req: ScanRequest):  # note: plain def, not async def
+def scan(req: ScanRequest):
     url = req.url.strip()
     if not url.startswith("http"):
         url = "https://" + url
@@ -200,7 +200,7 @@ def agent_run(req: AgentRunRequest):
                     history.append({"action": action, "index": idx, "text": text, "reasoning": reasoning, "error": str(e)})
                     break
 
-                        violations = []
+            violations = []
             try:
                 page.add_script_tag(url=AXE_CDN)
                 page.wait_for_timeout(500)
