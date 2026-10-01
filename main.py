@@ -27,67 +27,6 @@ GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 GROQ_MODEL = "openai/gpt-oss-120b"
 
 
-class ScanRequest(BaseModel):
-    url: str
-
-
-@app.post("/scan")
-def scan(req: ScanRequest):
-    url = req.url.strip()
-    if not url.startswith("http"):
-        url = "https://" + url
-
-    started = time.time()
-    try:
-        with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
-            page = browser.new_page(viewport={"width": 1280, "height": 800})
-
-            page.goto(url, wait_until="domcontentloaded", timeout=20000)
-            title = page.title()
-
-            violations = []
-            try:
-                page.add_script_tag(url=AXE_CDN)
-                page.wait_for_timeout(500)
-                raw = page.evaluate("async () => { const r = await axe.run(); return JSON.parse(JSON.stringify(r)); }")
-                for v in raw.get("violations", []):
-                    for node in v.get("nodes", []):
-                        violations.append({
-                            "id": v.get("id"),
-                            "impact": v.get("impact") or "minor",
-                            "title": v.get("help"),
-                            "description": v.get("description"),
-                            "wcag": ", ".join(t.upper() for t in v.get("tags", []) if t.startswith("wcag")) or "Best Practice",
-                            "selector": (node.get("target") or ["unknown"])[0],
-                            "helpUrl": v.get("helpUrl"),
-                        })
-            except Exception as axe_err:
-                print("axe-core step failed:", axe_err)
-
-            screenshot_bytes = page.screenshot(full_page=False)
-            screenshot_b64 = base64.b64encode(screenshot_bytes).decode("utf-8")
-
-            browser.close()
-
-        return {
-            "url": url,
-            "title": title,
-            "screenshot": f"data:image/png;base64,{screenshot_b64}",
-            "violations": violations,
-            "scanTimeMs": round((time.time() - started) * 1000),
-        }
-
-    except Exception as e:
-        traceback.print_exc()
-        return JSONResponse(status_code=400, content={"detail": f"Scan failed: {str(e)}"})
-
-
-class AgentRunRequest(BaseModel):
-    url: str
-    goal: str
-
-
 def get_interactive_elements(page):
     return page.evaluate("""
     () => {
@@ -153,14 +92,22 @@ Use "done" as soon as the task appears complete, or if no useful element exists.
     return json.loads(content)
 
 
+class AgentRunRequest(BaseModel):
+    url: str
+    goal: str = ""
+
+
 @app.post("/agent-run")
 def agent_run(req: AgentRunRequest):
-    if not GROQ_API_KEY:
-        return JSONResponse(status_code=500, content={"detail": "GROQ_API_KEY not set on server."})
-
     url = req.url.strip()
     if not url.startswith("http"):
         url = "https://" + url
+
+    task = (req.goal or "").strip()
+    quick_scan_only = len(task) == 0
+
+    if not quick_scan_only and not GROQ_API_KEY:
+        return JSONResponse(status_code=500, content={"detail": "GROQ_API_KEY not set on server."})
 
     MAX_STEPS = 8
     history = []
@@ -172,40 +119,45 @@ def agent_run(req: AgentRunRequest):
             page = browser.new_page(viewport={"width": 1280, "height": 800})
             page.goto(url, wait_until="domcontentloaded", timeout=20000)
 
-            for step in range(MAX_STEPS):
-                elements = get_interactive_elements(page)
+            if quick_scan_only:
                 shot = base64.b64encode(page.screenshot(full_page=False)).decode("utf-8")
                 screenshots.append(f"data:image/png;base64,{shot}")
+                history.append({"action": "scan", "reasoning": "No task given — performing a direct accessibility scan of this page."})
+            else:
+                for step in range(MAX_STEPS):
+                    elements = get_interactive_elements(page)
+                    shot = base64.b64encode(page.screenshot(full_page=False)).decode("utf-8")
+                    screenshots.append(f"data:image/png;base64,{shot}")
 
-                try:
-                    decision = ask_llm_next_action(req.goal, page.url, elements, history)
-                except Exception as e:
-                    history.append({"action": "error", "reasoning": f"LLM decision failed: {e}", "error": str(e)})
-                    break
+                    try:
+                        decision = ask_llm_next_action(task, page.url, elements, history)
+                    except Exception as e:
+                        history.append({"action": "error", "reasoning": f"LLM decision failed: {e}", "error": str(e)})
+                        break
 
-                action = decision.get("action")
-                idx = decision.get("index")
-                text = decision.get("text")
-                reasoning = decision.get("reasoning", "")
+                    action = decision.get("action")
+                    idx = decision.get("index")
+                    text = decision.get("text")
+                    reasoning = decision.get("reasoning", "")
 
-                if action == "done":
-                    history.append({"action": "done", "reasoning": reasoning})
-                    break
+                    if action == "done":
+                        history.append({"action": "done", "reasoning": reasoning})
+                        break
 
-                matched = next((e for e in elements if e["index"] == idx), None)
-                bbox = matched["bbox"] if matched else None
+                    matched = next((e for e in elements if e["index"] == idx), None)
+                    bbox = matched["bbox"] if matched else None
 
-                try:
-                    target = page.locator(f'[data-agent-index="{idx}"]')
-                    if action == "click":
-                        target.click(timeout=5000)
-                    elif action == "type" and text:
-                        target.fill(text, timeout=5000)
-                    history.append({"action": action, "index": idx, "text": text, "reasoning": reasoning, "bbox": bbox})
-                    page.wait_for_timeout(1200)
-                except Exception as e:
-                    history.append({"action": action, "index": idx, "text": text, "reasoning": reasoning, "bbox": bbox, "error": str(e)})
-                    break
+                    try:
+                        target = page.locator(f'[data-agent-index="{idx}"]')
+                        if action == "click":
+                            target.click(timeout=5000)
+                        elif action == "type" and text:
+                            target.fill(text, timeout=5000)
+                        history.append({"action": action, "index": idx, "text": text, "reasoning": reasoning, "bbox": bbox})
+                        page.wait_for_timeout(1200)
+                    except Exception as e:
+                        history.append({"action": action, "index": idx, "text": text, "reasoning": reasoning, "bbox": bbox, "error": str(e)})
+                        break
 
             violations = []
             try:
@@ -230,11 +182,12 @@ def agent_run(req: AgentRunRequest):
             final_url = page.url
             browser.close()
 
-        goal_completed = any(h.get("action") == "done" for h in history)
+        goal_completed = quick_scan_only or any(h.get("action") == "done" for h in history)
         errored = any(h.get("error") for h in history)
 
         return {
-            "goal": req.goal,
+            "goal": task or "Accessibility scan (no task specified)",
+            "quickScanOnly": quick_scan_only,
             "startUrl": url,
             "finalUrl": final_url,
             "history": history,
@@ -248,4 +201,4 @@ def agent_run(req: AgentRunRequest):
 
     except Exception as e:
         traceback.print_exc()
-        return JSONResponse(status_code=400, content={"detail": f"Agent run failed: {str(e)}"})
+        return JSONResponse(status_code=400, content={"detail": f"Run failed: {str(e)}"})
