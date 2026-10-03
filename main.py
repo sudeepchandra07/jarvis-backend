@@ -125,7 +125,13 @@ def agent_run(req: AgentRunRequest):
                 history.append({"action": "scan", "reasoning": "No task given — performing a direct accessibility scan of this page."})
             else:
                 for step in range(MAX_STEPS):
-                    elements = get_interactive_elements(page)
+                    try:
+                        page.wait_for_load_state("domcontentloaded", timeout=5000)
+                        elements = get_interactive_elements(page)
+                    except Exception as e:
+                        history.append({"action": "error", "reasoning": f"Page navigated unexpectedly: {e}", "error": str(e)})
+                        break
+
                     shot = base64.b64encode(page.screenshot(full_page=False)).decode("utf-8")
                     screenshots.append(f"data:image/png;base64,{shot}")
 
@@ -161,6 +167,7 @@ def agent_run(req: AgentRunRequest):
 
             violations = []
             try:
+                page.wait_for_load_state("domcontentloaded", timeout=5000)
                 page.add_script_tag(url=AXE_CDN)
                 page.wait_for_timeout(500)
                 raw = page.evaluate("async () => { const r = await axe.run(); return JSON.parse(JSON.stringify(r)); }")
@@ -178,8 +185,13 @@ def agent_run(req: AgentRunRequest):
             except Exception as axe_err:
                 print("final axe-core scan failed:", axe_err)
 
-            final_shot = base64.b64encode(page.screenshot(full_page=False)).decode("utf-8")
-            final_url = page.url
+            try:
+                final_shot = base64.b64encode(page.screenshot(full_page=False)).decode("utf-8")
+                final_url = page.url
+            except Exception:
+                final_shot = screenshots[-1].split(",")[-1] if screenshots else ""
+                final_url = url
+
             browser.close()
 
         goal_completed = quick_scan_only or any(h.get("action") == "done" for h in history)
