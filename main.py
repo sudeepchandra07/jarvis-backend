@@ -100,6 +100,10 @@ class AgentRunRequest(BaseModel):
 @app.post("/agent-run")
 def agent_run(req: AgentRunRequest):
     url = req.url.strip()
+    # Strip any duplicated protocol accidentally concatenated in the input
+    if url.count("http") > 1:
+        last_http = url.rfind("http")
+        url = url[last_http:]
     if not url.startswith("http"):
         url = "https://" + url
 
@@ -155,6 +159,8 @@ def agent_run(req: AgentRunRequest):
 
                     try:
                         target = page.locator(f'[data-agent-index="{idx}"]')
+                        target.wait_for(state="visible", timeout=3000)
+                        target.scroll_into_view_if_needed(timeout=2000)
                         if action == "click":
                             target.click(timeout=5000)
                         elif action == "type" and text:
@@ -162,7 +168,7 @@ def agent_run(req: AgentRunRequest):
                         history.append({"action": action, "index": idx, "text": text, "reasoning": reasoning, "bbox": bbox})
                         page.wait_for_timeout(1200)
                     except Exception as e:
-                        history.append({"action": action, "index": idx, "text": text, "reasoning": reasoning, "bbox": bbox, "error": str(e)})
+                        history.append({"action": action, "index": idx, "text": text, "reasoning": reasoning, "bbox": bbox, "error": f"Element unavailable by the time the agent acted: {e}"})
                         break
 
             violations = []
